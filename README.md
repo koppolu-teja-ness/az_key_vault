@@ -22,6 +22,7 @@ deployed.
 - [Knowledge base](#knowledge-base)
 - [Current progress](#current-progress)
 - [Next steps to reach an end-to-end application](#next-steps-to-reach-an-end-to-end-application)
+- [Team / work assignment](#team--work-assignment)
 - [Troubleshooting](#troubleshooting)
 
 ## High-level architecture
@@ -305,6 +306,20 @@ What's **not** implemented yet (see [CAPSTONE_PLAN.md](CAPSTONE_PLAN.md) for ful
    can be tested without live Bedrock calls.
 8. **Packaging/UX**: replace raw `input()`/`print()` gates with a `rich`-based CLI table
    (as planned in CAPSTONE_PLAN.md) for a clearer human-review experience.
+
+## Team / work assignment
+
+The remaining CAPSTONE_PLAN.md work (items above) is split between two engineers so each
+can work mostly independently. Full step-by-step breakdown with dependencies lives in
+[CAPSTONE_PLAN.md § Work assignment](CAPSTONE_PLAN.md#work-assignment-2-engineers-charan-saurav).
+
+| Owner | Owns | Summary |
+|---|---|---|
+| **Charan** | Content + Graph core (Phase A, B) | Author the VPC/Functions Bicep resources, draft + get their knowledge-base docs reviewed, build the LangGraph `MigrationState`/node scaffolding (`graph.py`), `kb_draft_node`, and extend `migration_plan.py` for per-resource confidence + rationale. Also owns the final README/architecture doc update (step 14). |
+| **Saurav** | Guardrails, confidence, secrets, deploy (Phase C, D) | `orchestrator/guardrails.py` (checkov + custom checks), `orchestrator/confidence.py` (composite scoring), `guardrail_gate` node, `orchestrator/secrets_handling.py` (SecretValue + redaction filter), `orchestrator/deploy.py`, `orchestrator/verify.py`. Also drives `evaluation.py` and the end-to-end evaluation runs (step 12–13), since those depend on his deploy/verify code. |
+
+Both engineers review the shared evaluation report (calibration sanity check) before it's
+included in the capstone write-up.
 
 ## Troubleshooting
 

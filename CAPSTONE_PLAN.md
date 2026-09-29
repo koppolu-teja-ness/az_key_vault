@@ -168,13 +168,26 @@ the evaluation report (capstone metric: "is our confidence well-calibrated?").
 - Testing: `pytest` for deterministic nodes/guardrails/confidence math; recorded-response
   fixtures for the LLM plan node to test the self-correction loop without live Bedrock calls.
 
+## Work assignment (2 engineers: Charan, Saurav)
+
+Split along the natural Phase A/B (content + graph core) vs. Phase C/D (guardrails,
+secrets, deploy) boundary so each person can work mostly independently once Phase B step 3
+lands. Phase E is shared (each owns the half of the evaluation/report data driven by their
+own track).
+
+| Owner | Track | Phases |
+|---|---|---|
+| **Charan** | Content + Graph Core | Phase A (steps 1–2), Phase B (steps 3–5) |
+| **Saurav** | Guardrails, Confidence, Secrets, Deploy | Phase C (steps 6–8), Phase D (steps 9–11) |
+| **Both** | Evaluation & Docs | Phase E (steps 12–14) — Saurav drives `evaluation.py` + sample runs (12–13, needs his deploy/verify code); Charan drives the README/architecture doc update (14) |
+
 ## Phases / steps
-**Phase A — Content (parallel with Phase B)**
+**Phase A — Content (parallel with Phase B)** — Owner: **Charan**
 1. Author `resources/vpc/main.bicep` and `resources/functions/main.bicep`.
 2. Run `kb_draft_node` flow (or manually bootstrap) to produce the two new KB docs; human
    review; update `index.json`.
 
-**Phase B — Graph core** (*depends on nothing from Phase A to start scaffolding*)
+**Phase B — Graph core** (*depends on nothing from Phase A to start scaffolding*) — Owner: **Charan**
 3. Build `orchestrator/graph.py`: MigrationState + node wrappers around existing
    bicep_compiler/resource_extractor/knowledge_base/cloud_neutral/migration_plan/
    cfn_generator/validator modules (thin adapters, no logic rewrite).
@@ -182,40 +195,35 @@ the evaluation report (capstone metric: "is our confidence well-calibrated?").
 5. Extend `migration_plan.py` schema + `PLAN_JSON_SCHEMA_HINT` to require per-resource
    confidence + rationale (*depends on 3*).
 
-**Phase C — Guardrails & Confidence** (*depends on Phase B step 3*)
+**Phase C — Guardrails & Confidence** (*depends on Phase B step 3*) — Owner: **Saurav**
 6. `orchestrator/guardrails.py` — checkov integration + custom checks; wire into
    `validate_node`.
 7. `orchestrator/confidence.py` — composite scoring + `history.jsonl` read/write.
 8. `guardrail_gate` node wiring confidence + guardrail severity → forced human review.
 
-**Phase D — Secrets & Deploy** (*depends on Phase C*)
+**Phase D — Secrets & Deploy** (*depends on Phase C*) — Owner: **Saurav**
 9. `orchestrator/secrets_handling.py` — SecretValue wrapper + logging redaction filter.
 10. `orchestrator/deploy.py` — boto3-based create/update stack, human-approval gated.
 11. `orchestrator/verify.py` — per-resource-type post-deploy smoke tests.
 
-**Phase E — Evaluation & Docs** (*depends on D; can start report scaffolding earlier*)
+**Phase E — Evaluation & Docs** (*depends on D; can start report scaffolding earlier*) — Owner: **Both**
 12. `orchestrator/evaluation.py` — run-history logging + report generation (pass rate,
-    calibration/Brier score, human-intervention rate, time-to-migrate).
+    calibration/Brier score, human-intervention rate, time-to-migrate). *(Saurav)*
 13. Run N end-to-end migrations across the 3 resource types to populate real evaluation
-    data.
+    data. *(Saurav, with Charan's VPC/Functions content from Phase A)*
 14. Update README.md (new architecture, new resources) + write the differentiation/use-case
     section using the framing above; keep bicep-to-cloudformation.md as the single manual
-    reference doc as originally planned.
+    reference doc as originally planned. *(Charan)*
 
 ## Verification
-1. `pytest` covering: guardrail custom checks (unit), confidence composite formula (unit),
-   cfn_generator secret-literal scrub (unit), migration_plan schema validation w/ confidence
-   field (unit).
-2. Dry-run style check (no LLM/AWS calls) for all 3 resource types: compile→extract→CNR
-   only, confirming KB coverage after Phase A.
-3. Full graph run (LLM + guardrails, no deploy) for each resource type; confirm
-   `overall_confidence` populated and guardrail_gate triggers human_review as expected on a
-   deliberately bad plan fixture (e.g. inject an IAM `*` action) to prove the gate works.
-4. One real gated deploy + verify + rollback (`delete-stack`) cycle per resource type in a
-   sandbox AWS account, with explicit user confirmation before running (deploy is a
-   shared/costly action).
-5. Evaluation report reviewed for calibration sanity (predicted confidence vs actual
-   outcome across the sample runs).
+
+| # | Check | Owner |
+|---|---|---|
+| 1 | `pytest` covering: guardrail custom checks (unit), confidence composite formula (unit), cfn_generator secret-literal scrub (unit), migration_plan schema validation w/ confidence field (unit) | Split: Charan writes the `cfn_generator`/`migration_plan` unit tests, Saurav writes the guardrail/confidence unit tests |
+| 2 | Dry-run style check (no LLM/AWS calls) for all 3 resource types: compile→extract→CNR only, confirming KB coverage after Phase A | Charan |
+| 3 | Full graph run (LLM + guardrails, no deploy) for each resource type; confirm `overall_confidence` populated and guardrail_gate triggers human_review as expected on a deliberately bad plan fixture (e.g. inject an IAM `*` action) to prove the gate works | Saurav |
+| 4 | One real gated deploy + verify + rollback (`delete-stack`) cycle per resource type in a sandbox AWS account, with explicit user confirmation before running (deploy is a shared/costly action) | Saurav |
+| 5 | Evaluation report reviewed for calibration sanity (predicted confidence vs actual outcome across the sample runs) | Both |
 
 ## Further considerations
 1. Repo/folder is still named `az_key_vault` though scope now spans 3 services — cosmetic,
