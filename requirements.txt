@@ -1,0 +1,16 @@
+# Core dependencies for the Azure Bicep -> AWS CloudFormation migration pipeline
+
+# Required: Static validation (cfn-lint)
+cfn-lint>=1.57.0
+
+# Required: renders the migration plan into CloudFormation YAML
+pyyaml>=6.0
+
+# Required: AWS Bedrock LLM calls (only needed for full run, not --dry-run)
+boto3>=1.28.0
+
+# Required: 7-agent LangGraph orchestration (migrate_agents.py)
+langgraph>=0.2.0
+
+# Optional: Useful for local development
+# pip-tools>=7.0.0   # for requirements.in pinning

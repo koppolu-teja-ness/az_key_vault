@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Stores database credentials in AWS Secrets Manager.
+Parameters:
+  SecretNamePrefix:
+    Type: String
+    Default: ''
+    Description: Namespace for the secrets, e.g. 'myapp/prod'. Replaces the Key Vault
+      name, because Secrets Manager has no vault container. Secrets are created as
+      '<prefix>/db-username' and '<prefix>/db-password'.
+  DbUsername:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Database username to store in Secrets Manager.
+  DbPassword:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Database password to store in Secrets Manager.
+  KmsKeyId:
+    Type: String
+    Default: ''
+    Description: Optional. KMS key ID, ARN or alias used to encrypt the secrets. Leave
+      empty to use the AWS managed key aws/secretsmanager.
+Conditions:
+  UseCustomKmsKey:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: KmsKeyId
+      - ''
+  DbUsernameNotEmpty:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: DbUsername
+      - ''
+  DbPasswordNotEmpty:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: DbPassword
+      - ''
+Resources:
+  DbUsernameSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name:
+        Fn::Sub:
+        - ${SecretNamePrefix}/db-username
+        - {}
+      Description: Database username
+      SecretString:
+        Fn::If:
+        - DbUsernameNotEmpty
+        - Fn::If:
+          - UseCustomKmsKey
+          - Ref: DbUsername
+          - Fn::Join:
+            - ''
+            - - Ref: DbUsername
+        - Ref: AWS::NoValue
+      KmsKeyId:
+        Fn::If:
+        - UseCustomKmsKey
+        - Ref: KmsKeyId
+        - Ref: AWS::NoValue
+  DbPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name:
+        Fn::Sub:
+        - ${SecretNamePrefix}/db-password
+        - {}
+      Description: Database password
+      SecretString:
+        Fn::If:
+        - DbPasswordNotEmpty
+        - Fn::If:
+          - UseCustomKmsKey
+          - Ref: DbPassword
+          - Fn::Join:
+            - ''
+            - - Ref: DbPassword
+        - Ref: AWS::NoValue
+      KmsKeyId:
+        Fn::If:
+        - UseCustomKmsKey
+        - Ref: KmsKeyId
+        - Ref: AWS::NoValue
+Outputs:
+  DbUsernameSecretName:
+    Value:
+      Fn::Sub:
+      - ${SecretNamePrefix}/db-username
+      - {}
+    Description: Name of the db-username secret
+  DbPasswordSecretName:
+    Value:
+      Fn::Sub:
+      - ${SecretNamePrefix}/db-password
+      - {}
+    Description: Name of the db-password secret
+  DbUsernameSecretArn:
+    Value:
+      Fn::If:
+      - DbUsernameNotEmpty
+      - Ref: DbUsernameSecret
+      - Ref: AWS::NoValue
+    Description: ARN of the db-username secret
+  DbPasswordSecretArn:
+    Value:
+      Fn::If:
+      - DbPasswordNotEmpty
+      - Ref: DbPasswordSecret
+      - Ref: AWS::NoValue
+    Description: ARN of the db-password secret

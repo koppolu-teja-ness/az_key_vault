@@ -1,0 +1,4 @@
+{
+  "Microsoft.KeyVault/vaults": "../bicep-to-cloudformation.md",
+  "Microsoft.KeyVault/vaults/secrets": "../bicep-to-cloudformation.md"
+}
