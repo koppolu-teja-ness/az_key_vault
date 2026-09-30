@@ -9,7 +9,9 @@ into this shape instead of re-deriving everything from raw ARM JSON again.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+import os
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -75,6 +77,15 @@ def build_cnr(arm_template: dict) -> CloudNeutralRepresentation:
         resources=resources,
         outputs=arm_template.get("outputs", {}) or {},
     )
+
+
+def write_cnr(cnr: CloudNeutralRepresentation, output_dir: str, filename: str = "cnr.json") -> str:
+    """Serialize the cloud-neutral representation to a JSON file in the output folder."""
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, filename)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(asdict(cnr), f, indent=2, default=str)
+    return output_path
 
 
 def _derive_logical_id(resource: dict, parent_logical_id: str | None) -> str:

@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+# Non-interactive CFN parameter values (may contain secrets) -- see --params-file in README
+params.json
+*.params.json
+
+# Generated pipeline artifacts -- regenerated on every run, never source
+output/
+input/
+

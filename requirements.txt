@@ -12,5 +12,8 @@ boto3>=1.28.0
 # Required: 7-agent LangGraph orchestration (migrate_agents.py)
 langgraph>=0.2.0
 
+# Required: loads AZURE_RESOURCE_GROUP/AZURE_SUBSCRIPTION_ID/etc. from a local .env file
+python-dotenv>=1.0.0
+
 # Optional: Useful for local development
 # pip-tools>=7.0.0   # for requirements.in pinning

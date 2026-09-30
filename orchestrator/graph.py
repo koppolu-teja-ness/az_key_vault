@@ -2,27 +2,34 @@
 
 Graph shape:
 
-    agent1_validate --stop--> agent7_report --> END
+    agent0_export_resource_group --> agent1_validate --stop--> agent7_report --> END
                     --continue--> agent2_build_cnr --> agent3_map_resources
                     --> plan_approval_gate
                         --rejected--> agent7_report --> END
                         --approved--> agent4_render --> agent5_validate_cfn
                             --retry (lint fail, attempts left)--> agent3_map_resources
                             --give up (lint fail, attempts exhausted)--> agent7_report --> END
-                            --pass--> deploy_gate
-                                        --declined--> agent7_report --> END
-                                        --approved--> stack_check_gate
-                                            --cancelled/blocked--> agent7_report --> END
-                                            --ok--> agent6_deploy --> agent7_report --> END
+                            --pass--> stack_check_gate
+                                        --cancelled/blocked--> agent7_report --> END
+                                        --ok--> agent6_deploy --> agent7_report --> END
 
 Agents 1, 2, 4, 5 are deterministic wrappers around existing orchestrator
 modules; only agent3 (mapping) calls the LLM. plan_approval_gate is a
 mandatory human sign-off on the migration plan before any CloudFormation is
-generated; deploy_gate is a mandatory human-confirmation checkpoint before
-agent6 performs any real AWS mutation. stack_check_gate looks up the target
-CFN stack right before deployment and, if it already exists, asks the human
-to update it in place or delete-and-recreate it (auto-detecting unrecoverable
-states like ROLLBACK_COMPLETE that CloudFormation refuses to update).
+generated. Deployment itself (stack_check_gate onward) is fully automatic --
+there is no human-confirmation checkpoint and no interactive parameter-value
+prompt; agent6_deploy resolves parameter values from --params-file,
+CFN_PARAM_<NAME> env vars, a matching real value fetched from the source Key
+Vault (secrets only, resource-group export flow), or template Defaults,
+failing fast if none apply. stack_check_gate looks
+up the target CFN stack right before deployment and, if it already exists,
+asks the human to update it in place or delete-and-recreate it
+(auto-detecting unrecoverable states like ROLLBACK_COMPLETE that
+CloudFormation refuses to update) -- this is the one remaining interactive
+checkpoint, left in place intentionally.
+agent0_export_resource_group is a no-op (passthrough) unless the CLI was
+invoked with --resource-group, in which case it exports the live resource
+group to a .bicep file under the input directory before Agent 1 runs.
 """
 from __future__ import annotations
 
@@ -33,7 +40,7 @@ from langgraph.graph import END, StateGraph
 from .agents import (
     agent2_build_cnr,
     agent5_validate_cfn,
-    deploy_gate,
+    make_agent0_export_resource_group,
     make_agent1_validate,
     make_agent3_map_resources,
     make_agent4_render,
@@ -48,6 +55,10 @@ from .knowledge_base import KnowledgeBase
 from .state import MigrationState
 
 
+def _route_after_export(state: MigrationState) -> str:
+    return "report" if state.get("stopped") else "validate"
+
+
 def _route_after_validate(state: MigrationState) -> str:
     if state.get("stopped"):
         return "report"
@@ -58,7 +69,7 @@ def _route_after_validate(state: MigrationState) -> str:
 
 def _route_after_lint(state: MigrationState) -> str:
     if state.get("lint_passed"):
-        return "deploy_gate"
+        return "deploy"
     if state.get("fix_attempts", 0) < state.get("max_fix_attempts", 2):
         return "retry"
     return "report"
@@ -66,10 +77,6 @@ def _route_after_lint(state: MigrationState) -> str:
 
 def _route_after_plan_gate(state: MigrationState) -> str:
     return "render" if state.get("plan_confirmed") else "report"
-
-
-def _route_after_gate(state: MigrationState) -> str:
-    return "deploy" if state.get("deploy_confirmed") else "report"
 
 
 def _route_after_stack_check(state: MigrationState) -> str:
@@ -96,9 +103,11 @@ def build_graph(
     config: Config,
     output_dir: Path,
     reports_dir: Path,
+    input_dir: Path,
 ):
     graph = StateGraph(MigrationState)
 
+    graph.add_node("agent0_export_resource_group", make_agent0_export_resource_group(input_dir))
     graph.add_node("agent1_validate", make_agent1_validate(knowledge_base))
     graph.add_node("agent2_build_cnr", agent2_build_cnr)
     graph.add_node("agent3_map_resources", make_agent3_map_resources(knowledge_base, generator))
@@ -107,13 +116,15 @@ def build_graph(
     graph.add_node("agent5_validate_cfn", agent5_validate_cfn)
     graph.add_node("bump_fix_attempts", _bump_fix_attempts)
     graph.add_node("lint_give_up", _lint_give_up)
-    graph.add_node("deploy_gate", deploy_gate)
     graph.add_node("stack_check_gate", make_stack_check_gate(config))
     graph.add_node("agent6_deploy", make_agent6_deploy(config))
     graph.add_node("agent7_report", make_agent7_report(reports_dir))
 
-    graph.set_entry_point("agent1_validate")
+    graph.set_entry_point("agent0_export_resource_group")
 
+    graph.add_conditional_edges(
+        "agent0_export_resource_group", _route_after_export, {"report": "agent7_report", "validate": "agent1_validate"}
+    )
     graph.add_conditional_edges(
         "agent1_validate", _route_after_validate, {"report": "agent7_report", "continue": "agent2_build_cnr"}
     )
@@ -126,13 +137,10 @@ def build_graph(
     graph.add_conditional_edges(
         "agent5_validate_cfn",
         _route_after_lint,
-        {"retry": "bump_fix_attempts", "deploy_gate": "deploy_gate", "report": "lint_give_up"},
+        {"retry": "bump_fix_attempts", "deploy": "stack_check_gate", "report": "lint_give_up"},
     )
     graph.add_edge("bump_fix_attempts", "agent3_map_resources")
     graph.add_edge("lint_give_up", "agent7_report")
-    graph.add_conditional_edges(
-        "deploy_gate", _route_after_gate, {"deploy": "stack_check_gate", "report": "agent7_report"}
-    )
     graph.add_conditional_edges(
         "stack_check_gate", _route_after_stack_check, {"deploy": "agent6_deploy", "report": "agent7_report"}
     )

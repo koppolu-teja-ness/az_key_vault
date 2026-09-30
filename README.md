@@ -3,8 +3,10 @@
 An agentic, human-gated pipeline that migrates Azure Bicep infrastructure-as-code to AWS
 CloudFormation. A [LangGraph](https://langchain-ai.github.io/langgraph/) state graph of 7
 agents wraps deterministic parsing/rendering/validation code around a single LLM reasoning
-step (AWS Bedrock), with mandatory human approval before any CloudFormation is generated or
-deployed.
+step (AWS Bedrock), with mandatory human approval on the migration plan and the target
+stack before any CloudFormation is generated or deployed. Deployment itself (parameter
+resolution + `create_stack`/`update_stack`) is fully automatic once those gates pass — no
+confirmation prompt, no interactive parameter entry.
 
 > See [CAPSTONE_PLAN.md](CAPSTONE_PLAN.md) for the full target design (guardrails, confidence
 > scoring, multi-resource knowledge-base growth, evaluation harness). This README describes
@@ -14,6 +16,7 @@ deployed.
 - [High-level architecture](#high-level-architecture)
 - [The LangGraph agent graph](#the-langgraph-agent-graph)
 - [Workflows](#workflows)
+- [Non-interactive parameter resolution](#non-interactive-parameter-resolution)
 - [Project structure](#project-structure)
 - [Prerequisites](#prerequisites)
 - [Setup](#setup)
@@ -22,7 +25,6 @@ deployed.
 - [Knowledge base](#knowledge-base)
 - [Current progress](#current-progress)
 - [Next steps to reach an end-to-end application](#next-steps-to-reach-an-end-to-end-application)
-- [Team / work assignment](#team--work-assignment)
 - [Troubleshooting](#troubleshooting)
 
 ## High-level architecture
@@ -53,24 +55,22 @@ flowchart LR
 
     subgraph Human["Human-in-the-loop gates"]
         H1{{Plan approval gate}}
-        H2{{Deploy gate}}
         H3{{Stack conflict gate}}
     end
 
     A --> B --> C --> D --> E --> H1
     H1 -- approved --> F --> G
     G -- fail, retries left --> E
-    G -- pass --> H2 -- approved --> H3 -- ok --> I
+    G -- pass --> H3 -- ok --> I
     I --> R[(output/runs/&lt;id&gt;/report.md)]
     H1 -- rejected --> R
-    H2 -- declined --> R
     H3 -- blocked/cancelled --> R
     G -- retries exhausted --> R
 ```
 
 ## The LangGraph agent graph
 
-`orchestrator/graph.py` wires 7 agents + 3 human-approval gates into a single
+`orchestrator/graph.py` wires 7 agents + 2 human-approval gates into a single
 `StateGraph` (state shape defined in [orchestrator/state.py](orchestrator/state.py)):
 
 | Step | Node | Type | Responsibility |
@@ -81,9 +81,8 @@ flowchart LR
 | — | `plan_approval_gate` | **human gate** | Print the plan + mapping table, require explicit `y` before any CFN is generated |
 | 4 | `agent4_render` | deterministic | Render the approved plan into CloudFormation YAML (no LLM involved) |
 | 5 | `agent5_validate_cfn` | deterministic | Run `cfn-lint`; on failure, loop back to Agent 3 with the error feedback (self-correction), up to `MAX_FIX_ATTEMPTS` |
-| — | `deploy_gate` | **human gate** | Require explicit `y` before any real AWS mutation |
 | — | `stack_check_gate` | **human gate** | Look up the target CFN stack; if it exists, ask to update in place or delete-and-recreate (auto-detects stuck states like `ROLLBACK_COMPLETE`) |
-| 6 | `agent6_deploy` | deterministic | Real `boto3` `create_stack`/`update_stack`, prompts for each template parameter (masks `NoEcho`/secure values via `getpass`), verifies secrets post-deploy |
+| 6 | `agent6_deploy` | deterministic | Real `boto3` `create_stack`/`update_stack` -- fully automatic parameter resolution (`--params-file` → `CFN_PARAM_<NAME>` env var → source Key Vault secret/name → template Default), verifies secrets post-deploy |
 | 7 | `agent7_report` | deterministic | Write `output/runs/<run_id>/report.md` from the full `agent_log` |
 
 ```mermaid
@@ -98,16 +97,13 @@ flowchart TD
     A4 --> A5[agent5_validate_cfn]
     A5 -- lint fail, retries left --> BUMP[bump_fix_attempts] --> A3
     A5 -- lint fail, exhausted --> GIVEUP[lint_give_up] --> R7
-    A5 -- lint pass --> DG{{deploy_gate}}
-    DG -- declined --> R7
-    DG -- approved --> SG{{stack_check_gate}}
+    A5 -- lint pass --> SG{{stack_check_gate}}
     SG -- cancelled/blocked --> R7
     SG -- ok --> A6[agent6_deploy]
     A6 --> R7
     R7 --> E([END])
 
     style PG fill:#fff3cd,stroke:#b8860b
-    style DG fill:#fff3cd,stroke:#b8860b
     style SG fill:#fff3cd,stroke:#b8860b
     style R7 fill:#d4edda,stroke:#2e7d32
 ```
@@ -126,11 +122,16 @@ a report. Useful for quickly validating a new `.bicep` file before spending an L
 python migrate_agents.py keyvault.bicep --dry-run
 ```
 
-### 2. Full run (LLM + human approval gates + real deploy)
+### 2. Full run (LLM + human approval gates + automatic deploy)
 Runs the entire graph above. You will be prompted at up to three points:
 1. **Unsupported resource types** (Agent 1) — continue with supported resources only, or stop.
 2. **Plan approval gate** — review the LLM's resource/AWS mapping table before any YAML is generated.
-3. **Deploy gate** + **stack conflict gate** — confirm before any real `boto3` CloudFormation mutation, and choose update vs. delete-recreate if the stack already exists in a conflicting state.
+3. **Stack conflict gate** — choose update vs. delete-recreate vs. cancel if the target stack
+   already exists (only prompts when there's actually a conflict to resolve).
+
+Once those pass, **Agent 6 deploys automatically** — no confirmation prompt, no interactive
+parameter entry. See [Non-interactive parameter resolution](#non-interactive-parameter-resolution)
+for where CFN template parameter values come from.
 
 ```powershell
 python migrate_agents.py keyvault.bicep
@@ -146,9 +147,37 @@ An older, non-agentic version of the same deterministic-render / LLM-reasoning s
 exists (`migrate.py` → `orchestrator/pipeline.py`), kept for backward compatibility. It has
 no human approval gates and no deploy step — prefer `migrate_agents.py` for anything new.
 
+
 ```powershell
 python migrate.py keyvault.bicep --dry-run
 ```
+
+## Non-interactive parameter resolution
+
+Agent 6 never prompts for a CFN template parameter value. For each parameter, it resolves a
+value in this priority order and fails the run fast (clear error, no silent fallback) if
+nothing applies:
+
+1. **`--params-file <path.json>`** — a flat JSON object, e.g. `{"SecretNamePrefix": "myapp/prod"}`.
+2. **`CFN_PARAM_<NAME>`** environment variable (e.g. `CFN_PARAM_SECRETNAMEPREFIX`).
+3. **Source Key Vault secret** (`NoEcho`/secret parameters only, resource-group export flow
+   only) — Agent 0 reads every secret's real value from the source Key Vault's data plane
+   (`az keyvault secret show`) and matches it to a parameter by normalized name (e.g.
+   `DbPassword` ↔ `db-password`). Requires the `az` CLI identity to hold a data-plane role
+   such as **Key Vault Secrets User** on the vault; any fetch failure (e.g. `Forbidden`) is
+   logged as a warning by Agent 0, not raised.
+4. **Template `Default`** (never used for `NoEcho`/secret parameters, mirroring the old
+   interactive behavior).
+5. **Source resource group / Key Vault name** — only for non-secret parameters whose name
+   looks like a naming/prefix param (contains "prefix" or "namespace", e.g.
+   `SecretNamePrefix`) *and* have no `Default`. This is a narrow heuristic; anything else
+   unresolved still fails fast rather than guessing.
+
+Every resolved value is still checked against the parameter's own `MinLength`/`MaxLength`/
+`AllowedPattern`/`AllowedValues` before `CreateStack`/`UpdateStack`.
+
+Only `stack_check_gate` remains interactive (choosing update/delete-recreate/cancel when the
+target stack already exists) — that's intentional, since it can be destructive.
 
 ## Project structure
 
@@ -165,7 +194,7 @@ python migrate.py keyvault.bicep --dry-run
 │   └── index.json                 # ARM resource type -> mapping doc path
 ├── orchestrator/
 │   ├── state.py                   # MigrationState TypedDict (shared graph state)
-│   ├── agents.py                  # agent1..agent7 + plan_approval_gate/deploy_gate/stack_check_gate
+│   ├── agents.py                  # agent1..agent7 + plan_approval_gate/stack_check_gate
 │   ├── graph.py                   # build_graph() — StateGraph wiring, routing, retry loop
 │   ├── bicep_compiler.py          # az bicep build -> ARM JSON
 │   ├── resource_extractor.py      # Walk ARM JSON, collect resource types
@@ -175,6 +204,7 @@ python migrate.py keyvault.bicep --dry-run
 │   ├── generator.py               # Generator ABC + BedrockGenerator (pluggable LLM backend)
 │   ├── cfn_generator.py           # Deterministic MigrationPlan -> CloudFormation YAML
 │   ├── validator.py               # cfn-lint integration
+│   ├── azure_export.py            # az group export/decompile + source Key Vault secret fetch
 │   ├── config.py                  # Env-var driven Config (region, model id, retry limit)
 │   └── pipeline.py                # Legacy linear pipeline used by migrate.py
 └── output/
@@ -233,6 +263,7 @@ mapping table, and final status (completed / stopped + reason).
 | `AWS_REGION` | `us-east-1` | Region for Bedrock + CloudFormation calls |
 | `BEDROCK_MODEL_ID` | `amazon.nova-pro-v1:0` | Bedrock model used by Agent 3 |
 | `MAX_FIX_ATTEMPTS` | `2` | Self-correction retries on `cfn-lint` failure before giving up |
+| `CFN_PARAM_<NAME>` | — | Non-interactive value for CFN template parameter `<NAME>` (see [Non-interactive parameter resolution](#non-interactive-parameter-resolution)) |
 
 ## Knowledge base
 
@@ -252,15 +283,20 @@ To add a new resource type:
 ## Current progress
 
 What's implemented and verified end-to-end (dry-run and full run, including the retry loop
-and a declined deploy gate) as of 2026-09-29:
+and fully automatic deployment) as of 2026-09-30:
 
 - ✅ 7-agent LangGraph pipeline (`migrate_agents.py`) covering compile → extract → CNR →
-  LLM plan → plan approval gate → render → lint → self-correction retry → deploy gate →
+  LLM plan → plan approval gate → render → lint → self-correction retry →
   stack conflict gate → real `boto3` deploy → report.
 - ✅ Single resource type in scope: **Azure Key Vault → AWS Secrets Manager** (vault +
   secrets), backed by one human-authored knowledge-base doc.
-- ✅ Three mandatory human-in-the-loop checkpoints (plan approval, deploy confirmation,
-  stack conflict resolution) — no autonomous deployment.
+- ✅ Two mandatory human-in-the-loop checkpoints (plan approval, stack conflict resolution)
+  — deployment itself (parameter resolution + create/update-stack) is fully automatic once
+  those pass, no confirmation prompt and no interactive parameter entry.
+- ✅ Non-interactive CFN parameter resolution: `--params-file` → `CFN_PARAM_<NAME>` env var →
+  source Key Vault secret (matched by normalized name, requires `Key Vault Secrets User`-level
+  RBAC) → template `Default` → source resource group/vault name (naming/prefix params only).
+  Anything still unresolved or invalid fails the run fast instead of blocking on input.
 - ✅ Client-side parameter validation (`MinLength`/`MaxLength`/`AllowedPattern`/
   `AllowedValues`) before `CreateStack`/`UpdateStack` to avoid `ROLLBACK_COMPLETE` stacks
   from LLM-generated defaults that violate their own constraints.
@@ -274,8 +310,9 @@ What's **not** implemented yet (see [CAPSTONE_PLAN.md](CAPSTONE_PLAN.md) for ful
   agent-drafted-knowledge-base-doc flow.
 - ❌ Guardrail security scanning (`checkov`/`cfn_nag`) and custom secret/IAM/network checks.
 - ❌ Composite confidence scoring per resource + calibration history (`history.jsonl`).
-- ❌ Dedicated `SecretValue` wrapper + logging redaction filter (secrets are currently
-  handled via `getpass` at the deploy boundary only, not masked end-to-end in state/logs).
+- ❌ Dedicated `SecretValue` wrapper + logging redaction filter (secret values are never
+  logged/printed today, but only because call sites are careful to log parameter *names*,
+  not because of a wrapper type enforcing it end-to-end in state/logs).
 - ❌ Post-deploy verification beyond the basic secret existence check in Agent 6
   (no VPC reachability check, no Lambda invoke smoke test — those resource types don't
   exist yet).
@@ -288,7 +325,7 @@ What's **not** implemented yet (see [CAPSTONE_PLAN.md](CAPSTONE_PLAN.md) for ful
    `resources/functions/main.bicep`, draft their knowledge-base docs (human-reviewed), and
    add them to `knowledge_base/index.json`.
 2. **Guardrails**: add `orchestrator/guardrails.py` (checkov/cfn_nag + custom secret/IAM/
-   network checks) and wire a `guardrail_gate` node before the deploy gate.
+   network checks) and wire a `guardrail_gate` node before `agent6_deploy`.
 3. **Confidence scoring**: add `orchestrator/confidence.py` combining LLM self-reported
    confidence, lint/guardrail pass-fail, and historical success rate from
    `output/runs/history.jsonl`; surface it in the plan approval gate.
@@ -307,20 +344,6 @@ What's **not** implemented yet (see [CAPSTONE_PLAN.md](CAPSTONE_PLAN.md) for ful
 8. **Packaging/UX**: replace raw `input()`/`print()` gates with a `rich`-based CLI table
    (as planned in CAPSTONE_PLAN.md) for a clearer human-review experience.
 
-## Team / work assignment
-
-The remaining CAPSTONE_PLAN.md work (items above) is split between two engineers so each
-can work mostly independently. Full step-by-step breakdown with dependencies lives in
-[CAPSTONE_PLAN.md § Work assignment](CAPSTONE_PLAN.md#work-assignment-2-engineers-charan-saurav).
-
-| Owner | Owns | Summary |
-|---|---|---|
-| **Charan** | Content + Graph core (Phase A, B) | Author the VPC/Functions Bicep resources, draft + get their knowledge-base docs reviewed, build the LangGraph `MigrationState`/node scaffolding (`graph.py`), `kb_draft_node`, and extend `migration_plan.py` for per-resource confidence + rationale. Also owns the final README/architecture doc update (step 14). |
-| **Saurav** | Guardrails, confidence, secrets, deploy (Phase C, D) | `orchestrator/guardrails.py` (checkov + custom checks), `orchestrator/confidence.py` (composite scoring), `guardrail_gate` node, `orchestrator/secrets_handling.py` (SecretValue + redaction filter), `orchestrator/deploy.py`, `orchestrator/verify.py`. Also drives `evaluation.py` and the end-to-end evaluation runs (step 12–13), since those depend on his deploy/verify code. |
-
-Both engineers review the shared evaluation report (calibration sanity check) before it's
-included in the capstone write-up.
-
 ## Troubleshooting
 
 **`az bicep build` not found** — install the Azure CLI and Bicep extension, then verify
@@ -335,7 +358,22 @@ loop; warnings (`W...`) are reported but don't block deployment.
 **Stack stuck in `ROLLBACK_COMPLETE`/`CREATE_FAILED`/`DELETE_FAILED`** — handled
 automatically by `stack_check_gate`, which offers to delete-and-recreate the stack.
 
+**`No value available for required parameter '<Name>'`** — Agent 6 couldn't resolve that
+CFN parameter non-interactively. Supply it via `--params-file`/`CFN_PARAM_<NAME>` (see
+[Non-interactive parameter resolution](#non-interactive-parameter-resolution)); this is
+expected for parameters that aren't secrets, don't match a naming/prefix heuristic, and
+have no template `Default` — the LLM-generated plan varies run to run.
+
+**Key Vault secret fetch warning (`Forbidden`/`ForbiddenByRbac`)** — the `az` CLI identity
+needs a data-plane role on the source vault (it's not enough to have control-plane/ARM
+access). Grant it, e.g.:
+```powershell
+az role assignment create --role "Key Vault Secrets User" --assignee-object-id <your-oid> --assignee-principal-type User --scope <vault-resource-id>
+```
+Until granted, secret parameters fall through to `--params-file`/`CFN_PARAM_<NAME>` or fail fast.
+
 ---
 
 **Status:** Pilot — Key Vault → Secrets Manager working end-to-end through the 7-agent
-graph with human approval gates; see [Current progress](#current-progress) above for scope.
+graph with plan/stack approval gates and fully automatic deployment; see
+[Current progress](#current-progress) above for scope.

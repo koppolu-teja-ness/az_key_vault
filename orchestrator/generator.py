@@ -23,8 +23,15 @@ migration plan -- you do not write CloudFormation template syntax yourself.
 
 Rules:
 - Use the provided mapping reference doc(s) as the authoritative source for \
-resource/parameter/property mapping decisions; do not invent mappings that \
-contradict them.
+resource/parameter/property mapping decisions (which AWS type to use, how \
+properties translate); do not invent mappings that contradict them.
+- Synthesize a clean, PascalCase logical_id for each resource from the \
+MEANINGFUL part of its source identifier in the cloud-neutral representation \
+(e.g. the trailing segment of its name_expression or its resource role -- a \
+secret named '.../db-username' becomes "DbUsernameSecret"). Do NOT copy a \
+reference doc's example names verbatim, and do NOT reuse the CNR's raw \
+auto-generated logical_id strings as-is (those are ARM-derived scaffolding \
+identifiers, not meant for reuse).
 - Preserve parameter names' intent (e.g. secure params -> NoEcho: true).
 - Output ONLY the JSON object described in the instructions, no commentary, no \
 markdown fences.

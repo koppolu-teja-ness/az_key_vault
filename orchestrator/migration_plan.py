@@ -85,6 +85,13 @@ and how each maps back to its source resource. Do NOT produce CloudFormation \
 YAML or any template syntax yourself; a separate deterministic generator turns \
 your plan into the final template.
 
+Synthesize clean, PascalCase logical_id and output names from the MEANINGFUL \
+part of each resource's identity in the cloud-neutral representation below \
+(e.g. the trailing segment of its name_expression, such as 'db-username' -> \
+"DbUsernameSecret") -- do NOT copy the reference doc's example names verbatim, \
+and do NOT reuse the CNR's raw auto-generated logical_id strings as-is (those \
+are ARM-derived scaffolding identifiers, not meant for reuse).
+
 ## Cloud-neutral representation
 ```json
 {cnr_json}

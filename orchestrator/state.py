@@ -24,6 +24,13 @@ class MigrationState(TypedDict, total=False):
     run_id: str
     dry_run: bool
 
+    # Agent 0: export an Azure resource group as the source .bicep (optional;
+    # if resource_group is unset, bicep_path above is used as-is)
+    resource_group: str
+    subscription_id: str
+    source_secret_values: dict[str, str]  # real Key Vault secret values, keyed by secret name
+    source_vault_names: list[str]  # Key Vault name(s) found in the source resource group
+
     # Agent 1: validate
     arm_template: dict[str, Any]
     resource_types: list[str]
@@ -53,11 +60,14 @@ class MigrationState(TypedDict, total=False):
     # Agent 5: validate rendered template
     lint_passed: bool
     lint_output: str
+    lint_errors: int
+    lint_warnings: int
+    validation_history: Annotated[list[dict], operator.add]  # one entry per cfn-lint attempt
     fix_attempts: int
     max_fix_attempts: int
 
-    # Deploy gate + stack conflict gate + Agent 6: deploy
-    deploy_confirmed: bool
+    # Stack conflict gate + Agent 6: deploy (fully automatic, no human confirmation)
+    param_overrides: dict[str, str]  # CFN parameter values from --params-file / CLI
     stack_action: str  # "create" | "update" (decided by stack_check_gate)
     deploy_result: dict
     verify_result: dict

@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-import getpass
+import json
+import os
 import re
 from pathlib import Path
 from typing import Any
 
+from .azure_export import AzureExportError, export_resource_group_to_bicep, fetch_resource_group_secret_values
 from .bicep_compiler import BicepCompilerError, compile_bicep_to_arm
 from .cfn_generator import generate_cloudformation
-from .cloud_neutral import build_cnr
+from .cloud_neutral import build_cnr, write_cnr
 from .config import Config
 from .generator import Generator, GeneratorNotConfiguredError
 from .knowledge_base import KnowledgeBase
@@ -33,6 +35,63 @@ from .validator import run_cfn_lint
 
 def _log(agent: str, status: str, message: str) -> list[dict]:
     return [{"agent": agent, "status": status, "message": message}]
+
+
+def _run_dir(state: MigrationState) -> Path:
+    """Per-run artifact folder (CNR, migration plan, lint report, final report.md)."""
+    run_dir = Path(state["output_dir"]) / "runs" / state["run_id"]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+# ---------------------------------------------------------------------------
+# Agent 0: export a live Azure resource group as the source .bicep file.
+# Only runs when a resource_group was passed instead of an existing .bicep file.
+# ---------------------------------------------------------------------------
+def make_agent0_export_resource_group(input_dir: Path):
+    def agent0_export_resource_group(state: MigrationState) -> dict:
+        resource_group = state.get("resource_group")
+        if not resource_group:
+            return {
+                "agent_log": _log(
+                    "agent0_export_resource_group", "ok", "No resource group given; using the provided .bicep file."
+                ),
+            }
+
+        print(f"\n[Agent 0] Exporting resource group '{resource_group}' from Azure...")
+        try:
+            bicep_path = export_resource_group_to_bicep(
+                resource_group, input_dir, state.get("subscription_id")
+            )
+        except AzureExportError as exc:
+            return {
+                "stopped": True,
+                "stop_reason": f"Resource group export failed: {exc}",
+                "agent_log": _log("agent0_export_resource_group", "stopped", str(exc)),
+            }
+
+        # ARM/Bicep exports never include Key Vault secret values (Azure omits them from
+        # the control-plane export API); read the real values from the data plane here so
+        # agent6_deploy can carry them over instead of fabricating new ones.
+        source_secret_values, source_vault_names, secret_fetch_warnings = fetch_resource_group_secret_values(
+            resource_group, state.get("subscription_id")
+        )
+        log_entries = _log(
+            "agent0_export_resource_group", "ok",
+            f"Exported resource group '{resource_group}' to {bicep_path}. "
+            f"Fetched {len(source_secret_values)} real secret value(s) from Key Vault.",
+        )
+        for warning in secret_fetch_warnings:
+            print(f"[Agent 0] warning: {warning}")
+            log_entries += _log("agent0_export_resource_group", "warning", warning)
+        return {
+            "bicep_path": str(bicep_path),
+            "source_secret_values": source_secret_values,
+            "source_vault_names": source_vault_names,
+            "agent_log": log_entries,
+        }
+
+    return agent0_export_resource_group
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +169,11 @@ def make_agent1_validate(knowledge_base: KnowledgeBase):
 
 # ---------------------------------------------------------------------------
 # Agent 2: build the cloud-neutral representation (custom template per resource)
+
 # ---------------------------------------------------------------------------
 def agent2_build_cnr(state: MigrationState) -> dict:
     cnr = build_cnr(state["arm_template"])
+    write_cnr(cnr, output_dir=str(_run_dir(state)))
     per_resource_templates = {
         r.logical_id: dataclasses.asdict(r)
         for r in cnr.resources
@@ -147,6 +208,9 @@ def make_agent3_map_resources(knowledge_base: KnowledgeBase, generator: Generato
             mapping_docs = knowledge_base.load_docs(state["resource_types"])
             prompt = build_migration_plan_prompt(state["cnr"], mapping_docs)
 
+        run_dir = _run_dir(state)
+        (run_dir / "migration_prompt.txt").write_text(prompt, encoding="utf-8")
+
         raw_plan_text = generator.generate(prompt)
         try:
             plan = parse_migration_plan(raw_plan_text)
@@ -157,6 +221,10 @@ def make_agent3_map_resources(knowledge_base: KnowledgeBase, generator: Generato
                 "stop_reason": f"Migration plan invalid: {exc}",
                 "agent_log": _log("agent3_map_resources", "failed", str(exc)),
             }
+
+        (run_dir / "migration_plan.json").write_text(
+            json.dumps(dataclasses.asdict(plan), indent=2, default=str), encoding="utf-8"
+        )
 
         mapping_table = [
             {
@@ -238,18 +306,78 @@ def make_agent4_render(output_dir: Path):
 # ---------------------------------------------------------------------------
 # Agent 5: validate the rendered template (cfn-lint).
 # ---------------------------------------------------------------------------
+def _count_lint_findings(lint_output: str) -> tuple[int, int]:
+    """Count cfn-lint error (E####) vs. warning (W####) codes at line starts."""
+    errors = len(re.findall(r"(?m)^E\d{4}", lint_output))
+    warnings = len(re.findall(r"(?m)^W\d{4}", lint_output))
+    return errors, warnings
+
+
+def _render_validation_report(state: MigrationState, history: list[dict]) -> str:
+    """Attempt-by-attempt trace of what cfn-lint checked and where it failed/passed."""
+    max_attempts = state.get("max_fix_attempts", 2) + 1
+    lines = [
+        f"CFN VALIDATION REPORT -- run {state.get('run_id')}",
+        f"Template: {state.get('output_path')}",
+        "Tool: cfn-lint, run against the rendered template before any real AWS call.",
+        "",
+    ]
+    for entry in history:
+        result = "PASSED" if entry["passed"] else "FAILED"
+        lines.append(
+            f"Attempt {entry['attempt']}/{max_attempts} -- {result} "
+            f"({entry['errors']} error(s), {entry['warnings']} warning(s))"
+        )
+        for out_line in entry["output"].splitlines():
+            lines.append(f"  {out_line}")
+        if not entry["passed"] and entry["attempt"] < max_attempts:
+            lines.append("  -> Fed back to Agent 3 (LLM) for a corrected migration plan.")
+        lines.append("")
+
+    final = history[-1]
+    if final["passed"]:
+        retries = final["attempt"] - 1
+        lines.append(
+            "Final result: PASSED"
+            + (f" after {retries} self-correction retry(ies)." if retries else " (first attempt).")
+        )
+    else:
+        lines.append(f"Final result: FAILED after {final['attempt']} attempt(s) -- retries exhausted.")
+    return "\n".join(lines) + "\n"
+
+
 def agent5_validate_cfn(state: MigrationState) -> dict:
     lint_passed, lint_output = run_cfn_lint(Path(state["output_path"]))
+    errors, warnings = _count_lint_findings(lint_output)
+    attempt_entry = {
+        "attempt": state.get("fix_attempts", 0) + 1,
+        "passed": lint_passed,
+        "errors": errors,
+        "warnings": warnings,
+        "output": lint_output.strip() or "(no findings)",
+    }
+    history = state.get("validation_history", []) + [attempt_entry]
+    (_run_dir(state) / "cfn_validation_report.txt").write_text(
+        _render_validation_report(state, history), encoding="utf-8"
+    )
     status = "ok" if lint_passed else "warning"
     return {
         "lint_passed": lint_passed,
         "lint_output": lint_output,
+        "lint_errors": errors,
+        "lint_warnings": warnings,
+        "validation_history": [attempt_entry],
         "agent_log": _log("agent5_validate_cfn", status, "cfn-lint passed." if lint_passed else lint_output),
     }
 
 
 # ---------------------------------------------------------------------------
 # Agent 6: deploy the validated template to AWS and verify it (real deploy).
+# Fully automatic -- no human confirmation and no interactive value prompts.
+# Parameter values are resolved from --params-file, CFN_PARAM_<NAME> env vars,
+# the template's own Default, or (for NoEcho/secret params only) a securely
+# generated random value; anything still unresolved or invalid fails the run
+# fast instead of blocking on input().
 # ---------------------------------------------------------------------------
 def make_agent6_deploy(config: Config):
     def agent6_deploy(state: MigrationState) -> dict:
@@ -258,25 +386,48 @@ def make_agent6_deploy(config: Config):
         plan = state["migration_plan"]
         stack_name = _stack_name_for(state)
         cfn = boto3.client("cloudformation", region_name=config.aws_region)
+        overrides = state.get("param_overrides") or {}
+        source_secret_values = state.get("source_secret_values") or {}
+        source_name_candidates = list(state.get("source_vault_names") or [])
+        if state.get("resource_group"):
+            source_name_candidates.append(state["resource_group"])
 
         param_values: dict[str, str] = {}
         parameters = []
+        carried_over: list[str] = []
+        named_from_source: list[str] = []
         for name, definition in (plan.parameters or {}).items():
-            no_echo = bool(definition.get("NoEcho"))
-            default = definition.get("Default")
-            while True:
-                if no_echo:
-                    # Secure params are always entered fresh -- never reuse a template Default.
-                    value = getpass.getpass(f"Value for secure parameter '{name}': ")
-                elif default not in (None, ""):
-                    value = str(default)
-                else:
-                    value = input(f"Value for parameter '{name}': ")
-                error = _validate_param_value(value, definition)
-                if error is None:
-                    break
-                print(f"Invalid value for '{name}': {error}. Please re-enter.")
-                default = None  # a bad Default must not be silently reused on retry
+            value, source = _resolve_param_value(
+                name, definition, overrides, source_secret_values, source_name_candidates
+            )
+            if value is None:
+                msg = (
+                    f"No value available for required parameter '{name}'. Supply one via "
+                    f"--params-file, the CFN_PARAM_{name.upper()} environment variable, a matching "
+                    "source Key Vault secret, or a template Default."
+                )
+                return {
+                    "deploy_result": {"stack_name": stack_name, "status": "FAILED", "error": msg},
+                    "agent_log": _log("agent6_deploy", "failed", msg),
+                    "stopped": True,
+                    "stop_reason": msg,
+                }
+            error = _validate_param_value(value, definition)
+            if error is not None:
+                msg = (
+                    f"Parameter '{name}' value from {source} is invalid: {error}. Fix it via "
+                    f"--params-file or the CFN_PARAM_{name.upper()} environment variable."
+                )
+                return {
+                    "deploy_result": {"stack_name": stack_name, "status": "FAILED", "error": msg},
+                    "agent_log": _log("agent6_deploy", "failed", msg),
+                    "stopped": True,
+                    "stop_reason": msg,
+                }
+            if source == "source-keyvault":
+                carried_over.append(name)
+            elif source == "source-name":
+                named_from_source.append(name)
             param_values[name] = value
             parameters.append({"ParameterKey": name, "ParameterValue": value})
 
@@ -312,12 +463,15 @@ def make_agent6_deploy(config: Config):
         }
 
         verify_result = _verify_secrets(config, plan, param_values)
+        message = f"Stack '{stack_name}' deployed with status {deploy_result['status']}."
+        if carried_over:
+            message += f" Carried over real values from the source Key Vault for: {', '.join(carried_over)}."
+        if named_from_source:
+            message += f" Used the source resource group/Key Vault name for: {', '.join(named_from_source)}."
         return {
             "deploy_result": deploy_result,
             "verify_result": verify_result,
-            "agent_log": _log(
-                "agent6_deploy", "ok", f"Stack '{stack_name}' deployed with status {deploy_result['status']}."
-            ),
+            "agent_log": _log("agent6_deploy", "ok", message),
         }
 
     return agent6_deploy
@@ -325,6 +479,66 @@ def make_agent6_deploy(config: Config):
 
 def _stack_name_for(state: MigrationState) -> str:
     return f"migrated-{Path(state['bicep_path']).stem}"
+
+
+def _resolve_param_value(
+    name: str,
+    definition: dict,
+    overrides: dict[str, str],
+    source_secret_values: dict[str, str],
+    source_name_candidates: list[str],
+) -> tuple[str | None, str]:
+    """Resolve a CFN parameter value with no human input, in priority order:
+    --params-file override, CFN_PARAM_<NAME> env var, a matching real value
+    fetched from the source Key Vault (NoEcho params only), template Default
+    (never for NoEcho/secret params), then -- for naming/prefix-style params
+    only (e.g. 'SecretNamePrefix') with no Default -- the source resource
+    group/Key Vault name. Returns (value, source); value is None when nothing
+    could be resolved, which fails the run fast.
+    """
+    if name in overrides:
+        return overrides[name], "params-file"
+    env_value = os.environ.get(f"CFN_PARAM_{name.upper()}")
+    if env_value is not None:
+        return env_value, "environment"
+    no_echo = bool(definition.get("NoEcho"))
+    if no_echo:
+        matched = _match_source_secret(name, source_secret_values)
+        if matched is not None:
+            return matched, "source-keyvault"
+    default = definition.get("Default")
+    if not no_echo and default is not None:
+        return str(default), "template default"
+    if not no_echo and source_name_candidates and _looks_like_name_prefix_param(name):
+        return source_name_candidates[0], "source-name"
+    return None, "missing"
+
+
+_NAME_PREFIX_TOKENS = ("prefix", "namespace")
+
+
+def _looks_like_name_prefix_param(name: str) -> bool:
+    """Heuristic: does this parameter name look like a naming/prefix param
+    (e.g. 'SecretNamePrefix'), as opposed to an arbitrary required value we
+    can't safely guess (e.g. a KMS key ID)?
+    """
+    normalized = _normalize_key(name)
+    return any(token in normalized for token in _NAME_PREFIX_TOKENS)
+
+
+def _normalize_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _match_source_secret(name: str, source_secret_values: dict[str, str]) -> str | None:
+    """Match a CFN parameter name to a fetched Key Vault secret by normalized
+    name (case/hyphen/underscore-insensitive), e.g. 'DbPassword' <-> 'db-password'.
+    """
+    target = _normalize_key(name)
+    for secret_name, value in source_secret_values.items():
+        if _normalize_key(secret_name) == target:
+            return value
+    return None
 
 
 def _validate_param_value(value: str, definition: dict) -> str | None:
@@ -473,26 +687,6 @@ def _resolve_name(name: Any, param_values: dict[str, str]) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Deploy gate: mandatory human confirmation before any AWS mutation.
-# ---------------------------------------------------------------------------
-def deploy_gate(state: MigrationState) -> dict:
-    print(f"\n[Deploy gate] About to deploy '{state['output_path']}' to AWS region.")
-    answer = input("Proceed with real AWS deployment? [y/N] ").strip().lower()
-    confirmed = answer == "y"
-    update = {
-        "deploy_confirmed": confirmed,
-        "agent_log": _log(
-            "deploy_gate", "ok" if confirmed else "stopped",
-            "Human approved deployment." if confirmed else "Human declined deployment.",
-        ),
-    }
-    if not confirmed:
-        update["stopped"] = True
-        update["stop_reason"] = "Human declined deployment at the deploy gate."
-    return update
-
-
-# ---------------------------------------------------------------------------
 # Agent 7: write the migration report from the full graph state.
 # ---------------------------------------------------------------------------
 def make_agent7_report(reports_dir: Path):
@@ -543,8 +737,27 @@ def _render_report(state: MigrationState) -> str:
     if state.get("output_path"):
         lines += ["", "## Generated template (Agent 4)", "", f"- {state['output_path']}"]
 
-    if "lint_passed" in state:
-        lines += ["", "## Validation (Agent 5)", "", f"- cfn-lint passed: {state['lint_passed']}"]
+    if state.get("validation_history"):
+        max_attempts = state.get("max_fix_attempts", 2) + 1
+        lines += [
+            "",
+            "## Validation (Agent 5)",
+            "",
+            "`cfn-lint` run against the rendered template before any real AWS call:",
+            "",
+        ]
+        for entry in state["validation_history"]:
+            result = "PASSED" if entry["passed"] else "FAILED"
+            lines.append(
+                f"- Attempt {entry['attempt']}/{max_attempts}: **{result}** "
+                f"({entry['errors']} error(s), {entry['warnings']} warning(s))"
+            )
+            if not entry["passed"]:
+                first_line = entry["output"].splitlines()[0] if entry["output"] else ""
+                lines.append(f"  - {first_line}")
+                lines.append("  - Fed back to Agent 3 (LLM) for a corrected migration plan.")
+        lines.append("")
+        lines.append("Full per-attempt output: `cfn_validation_report.txt` in this run's folder.")
 
     if state.get("deploy_result"):
         lines += ["", "## Deployment (Agent 6)", ""]

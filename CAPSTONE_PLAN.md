@@ -22,6 +22,19 @@ scoring, security guardrails, and gated autonomous deployment. Differentiators t
 - Orchestration framework: LangGraph.
 - Deployment: agent runs actual `aws cloudformation deploy`/boto3, but only after a human
   approval gate (interrupt) — not fully autonomous.
+
+> **Update (2026-09-30):** in the existing pilot's `migrate_agents.py` graph (not this
+> planned Phase D redesign), the deploy-confirmation gate (`deploy_gate`) and the
+> interactive per-parameter `input()`/`getpass()` prompts were removed at the user's
+> request — Agent 6 now deploys fully automatically once `plan_approval_gate` and
+> `stack_check_gate` pass, resolving parameter values from `--params-file` /
+> `CFN_PARAM_<NAME>` env vars / a matching source Key Vault secret / template `Default` /
+> (naming-param heuristic only) the source resource group or vault name — see README.md's
+> [Non-interactive parameter resolution](README.md#non-interactive-parameter-resolution).
+> `stack_check_gate` is unchanged (still interactive). Whoever picks up Phase D
+> (`orchestrator/deploy.py`, "human-approval gated") should decide whether the redesigned
+> graph keeps that requirement or adopts the pilot's fully-automatic model before building it,
+> to avoid rebuilding a gate that was deliberately removed.
 - Confidence score = composite of (a) LLM self-reported confidence per resource,
   (b) validator pass/fail (cfn-lint + guardrail scan), (c) historical success rate for that
   resource type from a local run-history log.
@@ -143,6 +156,11 @@ the evaluation report (capstone metric: "is our confidence well-calibrated?").
   history / process list exposure) — deploy uses boto3 parameter dict, not
   `aws cloudformation deploy --parameter-overrides` subprocess string.
 
+> **Update (2026-09-30):** the pilot dropped `getpass` entirely (see the Phase D note
+> above) — non-secret and secret parameter values are now both sourced non-interactively
+> (`--params-file` / `CFN_PARAM_<NAME>` / source Key Vault / template Default / source
+> name), still never via CLI flags for the same shell-history/process-list reason.
+
 ## New source content required (parallel with graph build)
 - `resources/vpc/main.bicep` (Microsoft.Network/virtualNetworks + subnets + NSG) — target
   AWS::EC2::VPC + Subnets + SecurityGroup.
@@ -203,7 +221,11 @@ own track).
 
 **Phase D — Secrets & Deploy** (*depends on Phase C*) — Owner: **Saurav**
 9. `orchestrator/secrets_handling.py` — SecretValue wrapper + logging redaction filter.
-10. `orchestrator/deploy.py` — boto3-based create/update stack, human-approval gated.
+10. `orchestrator/deploy.py` — boto3-based create/update stack. **Note (2026-09-30):** the
+    pilot's `agent6_deploy` no longer gates on human approval or interactive parameter
+    entry (see the update note under "Confirmed decisions" above) — confirm with the team
+    whether this redesign should keep a human-approval gate or match the pilot's
+    fully-automatic model before implementing.
 11. `orchestrator/verify.py` — per-resource-type post-deploy smoke tests.
 
 **Phase E — Evaluation & Docs** (*depends on D; can start report scaffolding earlier*) — Owner: **Both**
